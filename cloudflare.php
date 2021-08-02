@@ -17,19 +17,29 @@ $cf->makeUpdateDNS();
 class updateCFDDNS
 {
     const API_URL = 'https://api.cloudflare.com';
-    var $account, $apiKey, $hostList, $ip;
+    var $account, $apiKey, $hostList, $ipv4; // argument properties - $ipv4 is provided by DSM itself
+    var $ip, $dnsRecordIdList = array(), $ipv6 = false;
 
     function __construct($argv)
     {
+        // Arguments: account, apikey, hostslist, ipv4 address (DSM 6/7 doesn't deliver IPV6)
         if (count($argv) != 5) {
             $this->badParam('wrong parameter count');
         }
 
         $this->apiKey = (string) $argv[2]; // CF Global API Key
         $hostname = (string) $argv[3]; // example: example.com.uk---sundomain.example1.com---example2.com
-        $this->ip = (string) $this->getIpAddressIpify();
 
+        // Returns either an IPV4 address when IPV6 is unsupported or not found, either returns an IPV6 address,
+        // in that case extra steps are necessary because in old version IPV4 won't be set any longer which is not ok
+        $this->ip = (string) $this->getIpAddressIpify(); // Can be either IPV4 or IPV6, should serve as IPV6 "detector"
         $this->validateIp($this->ip);
+
+        // Test addresss:
+//        $this->ipv6 = "2222:7e01::f03c:91ff:fe99:b41d";
+
+        // Since DSM is standard providing an IPv4 address, we always rely on what DSM is providing, not externally
+        $this->validateIp((string) $argv[4]);
 
         $arHost = explode('---', $hostname);
         if (empty($arHost)) {
@@ -41,19 +51,21 @@ class updateCFDDNS
                 'hostname' => '',
                 'fullname' => $value,
                 'zoneId' => '',
-                'recordId' => '',
-                'proxied' => true,
             ];
         }
 
         $this->setZones();
+
         foreach ($this->hostList as $arHost) {
-            $this->setRecord($arHost['fullname'], $arHost['zoneId']);
+            $this->setRecord($arHost, $this->ipv4, 'A');
+            if($this->ipv6) {
+                $this->setRecord($arHost, $this->ipv6, 'AAAA');
+            }
         }
     }
 
     /**
-     * Update CF DNS records 
+     * Update CF DNS records
      */
     function makeUpdateDNS()
     {
@@ -61,21 +73,18 @@ class updateCFDDNS
             $this->badParam('empty host list');
         }
 
-        foreach ($this->hostList as $arHost) {            
-            $post = [
-                'type' => $this->getZoneTypeByIp($this->ip),
-                'name' => $arHost['fullname'],
-                'content' => $this->ip,
-                'ttl' => 1,
-                'proxied' => $arHost['proxied'],
-            ];
+        foreach($this->dnsRecordIdList as $recordId => $dnsRecord) {
+            $zoneId = $dnsRecord['zoneId'];
+            unset($dnsRecord['zoneId']);
 
-            $json = $this->callCFapi("PUT", "client/v4/zones/" . $arHost['zoneId'] . "/dns_records/" . $arHost['recordId'], $post);
+            $json = $this->callCFapi("PATCH", "client/v4/zones/${zoneId}/dns_records/${recordId}", $dnsRecord);
+
             if (!$json['success']) {
                 echo 'Update Record failed';
                 exit();
             }
         }
+
         echo "good";
     }
 
@@ -85,29 +94,30 @@ class updateCFDDNS
         exit();
     }
 
+    /**
+     * Evaluates IP address type and asssigns to the correct IP property type
+     * Only public addresses accessible from the internet are valid
+     *
+     * @param $ip
+     * @return bool
+     */
     function validateIp($ip)
     {
-        if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE )) {
+            $this->ipv6 = $ip;
+        } elseif (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE )) {
+            $this->ipv4 = $ip;
+        } else {
             $this->badParam('invalid ip-address');
         }
         return true;
     }
+
     /*
     * get ip from ipify.org
     */
     function getIpAddressIpify() {
         return file_get_contents('https://api64.ipify.org');
-    }
-
-    /*
-    * IPv4 = zone A, IPv6 = zone AAAA
-    * @link https://www.cloudflare.com/en-au/learning/dns/dns-records/dns-a-record/
-    */
-    function getZoneTypeByIp($ip) {
-        if(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-            return 'AAAA';
-        }
-        return 'A';        
     }
 
     /**
@@ -152,25 +162,36 @@ class updateCFDDNS
     }
 
     /**
-     * Set Records for each hosts
+     * Set A Records for each host
      */
-    function setRecord($fullname, $zoneId)
+    function setRecord($arHostData, string $ip, $type)
     {
-        if (empty($fullname)) {
+        if (empty($arHostData['fullname'])) {
             return false;
         }
 
-        if (empty($zoneId)) {
+        if (empty($arHostData['zoneId'])) {
             unset($this->hostList[$fullname]);
             return false;
         }
 
-        $json = $this->callCFapi("GET", "client/v4/zones/${zoneId}/dns_records?type=A&name=${fullname}");
+        $zoneId = $arHostData['zoneId'];
+        $fullname = $arHostData['fullname'];
+
+        $json = $this->callCFapi("GET", "client/v4/zones/${zoneId}/dns_records?type=${type}&name=${fullname}");
+
         if (!$json['success']) {
             $this->badParam('unsuccessful response for getRecord host: ' . $fullname);
         }
-        $this->hostList[$fullname]['recordId'] = $json['result']['0']['id'];
-        $this->hostList[$fullname]['proxied'] = $json['result']['0']['proxied'];
+
+        if(isset($json['result']['0'])){
+            $this->dnsRecordIdList[$json['result']['0']['id']]['type'] = $type;
+            $this->dnsRecordIdList[$json['result']['0']['id']]['name'] = $arHostData['fullname'];
+            $this->dnsRecordIdList[$json['result']['0']['id']]['content'] = $ip;
+            $this->dnsRecordIdList[$json['result']['0']['id']]['zoneId'] = $arHostData['zoneId'];
+            $this->dnsRecordIdList[$json['result']['0']['id']]['ttl'] = $json['result']['0']['ttl'];
+            $this->dnsRecordIdList[$json['result']['0']['id']]['proxied'] = $json['result']['0']['proxied'];
+        }
     }
 
     /**
@@ -192,20 +213,26 @@ class updateCFDDNS
         switch($method) {
             case "GET":
                 $options[CURLOPT_HTTPGET] = true;
-            break;
+                break;
 
             case "POST":
                 $options[CURLOPT_POST] = true;
                 $options[CURLOPT_HTTPGET] = false;
                 $options[CURLOPT_POSTFIELDS] = json_encode($data);
-            break;
+                break;
 
             case "PUT":
                 $options[CURLOPT_POST] = false;
                 $options[CURLOPT_HTTPGET] = false;
                 $options[CURLOPT_CUSTOMREQUEST] = "PUT";
                 $options[CURLOPT_POSTFIELDS] = json_encode($data);
-            break;
+                break;
+            case "PATCH":
+                $options[CURLOPT_POST] = false;
+                $options[CURLOPT_HTTPGET] = false;
+                $options[CURLOPT_CUSTOMREQUEST] = "PATCH";
+                $options[CURLOPT_POSTFIELDS] = json_encode($data);
+                break;
         }
 
         $req = curl_init();
